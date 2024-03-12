@@ -17,12 +17,11 @@ import re
 import subprocess
 import sys
 
-from platformio.project.exception import PlatformioException
+from platformio.exception import PlatformioException
 from platformio.public import (
     DeviceMonitorFilterBase,
     load_build_metadata,
 )
-
 
 # By design, __init__ is called inside miniterm and we can't pass context to it.
 # pylint: disable=attribute-defined-outside-init
@@ -30,72 +29,14 @@ from platformio.public import (
 IS_WINDOWS = sys.platform.startswith("win")
 
 
-class Esp8266ExceptionDecoder(
-    DeviceMonitorFilterBase
-):  # pylint: disable=too-many-instance-attributes
-    NAME = "esp8266_exception_decoder"
+class Esp32ExceptionDecoder(DeviceMonitorFilterBase):
+    NAME = "esp32_exception_decoder"
 
-    # https://github.com/esp8266/esp8266-wiki/wiki/Memory-Map
-    ADDR_MIN = 0x40000000
-    ADDR_MAX = 0x40300000
-
-    STATE_DEFAULT = 0
-    STATE_IN_STACK = 1
-
-    EXCEPTION_MARKER = "Exception ("
-
-    # https://github.com/me-no-dev/EspExceptionDecoder/blob/a78672da204151cc93979a96ed9f89139a73893f/src/EspExceptionDecoder.java#L59
-    EXCEPTION_CODES = (
-        "Illegal instruction",
-        "SYSCALL instruction",
-        "InstructionFetchError: Processor internal physical address or data error during "
-        "instruction fetch",
-        "LoadStoreError: Processor internal physical address or data error during load or store",
-        "Level1Interrupt: Level-1 interrupt as indicated by set level-1 bits in "
-        "the INTERRUPT register",
-        "Alloca: MOVSP instruction, if caller's registers are not in the register file",
-        "IntegerDivideByZero: QUOS, QUOU, REMS, or REMU divisor operand is zero",
-        "reserved",
-        "Privileged: Attempt to execute a privileged operation when CRING ? 0",
-        "LoadStoreAlignmentCause: Load or store to an unaligned address",
-        "reserved",
-        "reserved",
-        "InstrPIFDataError: PIF data error during instruction fetch",
-        "LoadStorePIFDataError: Synchronous PIF data error during LoadStore access",
-        "InstrPIFAddrError: PIF address error during instruction fetch",
-        "LoadStorePIFAddrError: Synchronous PIF address error during LoadStore access",
-        "InstTLBMiss: Error during Instruction TLB refill",
-        "InstTLBMultiHit: Multiple instruction TLB entries matched",
-        "InstFetchPrivilege: An instruction fetch referenced a virtual address at a ring level "
-        "less than CRING",
-        "reserved",
-        "InstFetchProhibited: An instruction fetch referenced a page mapped with an attribute "
-        "that does not permit instruction fetch",
-        "reserved",
-        "reserved",
-        "reserved",
-        "LoadStoreTLBMiss: Error during TLB refill for a load or store",
-        "LoadStoreTLBMultiHit: Multiple TLB entries matched for a load or store",
-        "LoadStorePrivilege: A load or store referenced a virtual address at a ring level "
-        "less than CRING",
-        "reserved",
-        "LoadProhibited: A load referenced a page mapped with an attribute that does not "
-        "permit loads",
-        "StoreProhibited: A store referenced a page mapped with an attribute that does not "
-        "permit stores",
-    )
+    BACKTRACE_PATTERN = re.compile(r"^Backtrace:(((\s?0x[0-9a-fA-F]{8}:0x[0-9a-fA-F]{8}))+)")
+    BACKTRACE_ADDRESS_PATTERN = re.compile(r'0x[0-9a-fA-F]{8}:0x[0-9a-fA-F]{8}')
 
     def __call__(self):
         self.buffer = ""
-        self.previous_line = ""
-        self.state = self.STATE_DEFAULT
-        self.no_match_counter = 0
-        self.stack_lines = []
-
-        self.exception_re = re.compile(
-            r"^([0-9]{1,2})\):\n([a-z0-9]+=0x[0-9a-f]{8} ?)+$"
-        )
-        self.stack_re = re.compile(r"^[0-9a-f]{8}:\s+([0-9a-f]{8} ?)+ *$")
 
         self.firmware_path = None
         self.addr2line_path = None
@@ -159,127 +100,38 @@ See https://docs.platformio.org/page/projectconf/build_configurations.html
                 self.buffer = ""
             last = idx + 1
 
-            if line and line[-1] == "\r":
-                line = line[:-1]
-
-            extra = self.process_line(line)
-            self.previous_line = line
-            if extra is not None:
-                text = text[: idx + 1] + extra + text[idx + 1 :]
-                last += len(extra)
-        return text
-
-    def advance_state(self):
-        self.state += 1
-        self.no_match_counter = 0
-
-    def is_addr_ok(self, hex_addr):
-        try:
-            addr = int(hex_addr, 16)
-            return addr >= self.ADDR_MIN and addr < self.ADDR_MAX
-        except ValueError:
-            return False
-
-    def process_line(self, line):  # pylint: disable=too-many-return-statements
-        if self.state == self.STATE_DEFAULT:
-            extra = None
-            if self.previous_line.startswith(self.EXCEPTION_MARKER):
-                two_lines = (
-                    self.previous_line[len(self.EXCEPTION_MARKER) :] + "\n" + line
-                )
-                match = self.exception_re.match(two_lines)
-                if match is not None:
-                    extra = self.process_exception_match(match)
-
-            if line == ">>>stack>>>":
-                self.advance_state()
-            return extra
-        elif self.state == self.STATE_IN_STACK:
-            if line == "<<<stack<<<":
-                self.state = self.STATE_DEFAULT
-                return self.take_stack_lines()
-
-            match = self.stack_re.match(line)
-            if match is not None:
-                self.process_stack_match(line)
-                return None
-
-        self.no_match_counter += 1
-        if self.no_match_counter > 4:
-            self.state = self.STATE_DEFAULT
-            results = [self.take_stack_lines(), self.process_line(line)]
-            results = [r for r in results if r is not None]
-            if results:
-                return "\n".join(results)
-        return None
-
-    def process_exception_match(self, match):
-        extra = "\n"
-        try:
-            code = int(match.group(1))
-            if code >= 0 and code < len(self.EXCEPTION_CODES):
-                extra += "%s\n" % self.EXCEPTION_CODES[code]
-        except ValueError:
-            pass
-
-        header = match.group(0)
-        registers = header[header.index("\n") + 1 :].split()
-        pairs = [reg.split("=", 2) for reg in registers]
-
-        lines = self.get_lines([p[1] for p in pairs])
-
-        for i, p in enumerate(pairs):
-            if lines[i] is not None:
-                l = lines[i].replace(
-                    "\n", "\n    "
-                )  # newlines happen with inlined methods
-                extra += "  %s=%s in %s\n" % (p[0], p[1], l)
-        return extra
-
-    def process_stack_match(self, line):
-        if len(self.stack_lines) > 128:
-            return
-
-        addresses = line[line.index(":") + 1 :].split()
-        lines = self.get_lines(addresses)
-        for i, l in enumerate(lines):
-            if l is not None:
-                self.stack_lines.append("0x%s in %s" % (addresses[i], l))
-
-    def take_stack_lines(self):
-        if self.stack_lines:
-            res = "\n%s\n\n" % "\n".join(self.stack_lines)
-            self.stack_lines = []
-            return res
-        return None
-
-    def get_lines(self, addresses):
-        result = []
-
-        enc = "mbcs" if IS_WINDOWS else "utf-8"
-        args = [self.addr2line_path, u"-fipC", u"-e", self.firmware_path]
-
-        for addr in addresses:
-            if not self.is_addr_ok(addr):
-                result.append(None)
+            m = self.BACKTRACE_PATTERN.match(line)
+            if m is None:
                 continue
 
-            to_append = None
-            try:
+            trace = self.get_backtrace(m)
+            if len(trace) != "":
+                text = text[: idx + 1] + trace + text[idx + 1 :]
+                last += len(trace)
+        return text
+
+    def get_backtrace(self, match):
+        trace = "\n"
+        enc = "mbcs" if IS_WINDOWS else "utf-8"
+        args = [self.addr2line_path, u"-fipC", u"-e", self.firmware_path]
+        try:
+            for i, addr in enumerate(self.BACKTRACE_ADDRESS_PATTERN.findall(match.group(1))):
                 output = (
                     subprocess.check_output(args + [addr])
                     .decode(enc)
                     .strip()
                 )
-                if output != "?? ??:0":
-                    to_append = self.strip_project_dir(output)
-            except subprocess.CalledProcessError as e:
-                sys.stderr.write(
-                    "%s: failed to call %s: %s\n"
-                    % (self.__class__.__name__, self.addr2line_path, e)
-                )
-            result.append(to_append)
-        return result
+                output = output.replace(
+                    "\n", "\n     "
+                )  # newlines happen with inlined methods
+                output = self.strip_project_dir(output)
+                trace += "  #%-2d %s in %s\n" % (i, addr, output)
+        except subprocess.CalledProcessError as e:
+            sys.stderr.write(
+                "%s: failed to call %s: %s\n"
+                % (self.__class__.__name__, self.addr2line_path, e)
+            )
+        return trace
 
     def strip_project_dir(self, trace):
         while True:
